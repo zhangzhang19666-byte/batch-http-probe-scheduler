@@ -1,6 +1,6 @@
 name: Data Processing Pipeline
 
-# ⚠️ FOR TESTING PURPOSES ONLY
+# FOR TESTING PURPOSES ONLY
 
 on:
   schedule:
