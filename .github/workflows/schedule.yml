@@ -15,14 +15,6 @@ on:
         description: 'Print stats only (true/false)'
         required: false
         default: 'false'
-      worker_id:
-        description: 'This worker index (0-based). e.g. 0 or 1'
-        required: false
-        default: '0'
-      total_workers:
-        description: 'Total parallel workers. 1 = no split, 2 = split in half'
-        required: false
-        default: '1'
 
 jobs:
   process:
@@ -80,10 +72,7 @@ jobs:
         run: |
           DELAY="${{ github.event.inputs.delay || '1.5' }}"
           STATUS="${{ github.event.inputs.status_only || 'false' }}"
-          WORKER_ID="${{ github.event.inputs.worker_id || '0' }}"
-          TOTAL="${{ github.event.inputs.total_workers || '1' }}"
           ARGS="--db results_all.db --delay $DELAY --max-minutes 300"
-          ARGS="$ARGS --worker-id $WORKER_ID --total-workers $TOTAL"
           if [ "$STATUS" = "true" ]; then ARGS="$ARGS --status"; fi
           exec python src/batch_http_probe_scheduler.py $ARGS
 
