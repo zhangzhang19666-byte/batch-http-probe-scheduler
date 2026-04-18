@@ -8,7 +8,7 @@ on:
       delay:
         description: 'Request delay in seconds'
         required: false
-        default: '2.4'
+        default: '4.0'
 
 jobs:
   retry:

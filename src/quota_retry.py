@@ -199,8 +199,8 @@ def run(db_path: Path, delay: float, max_minutes: float):
 def main():
     p = argparse.ArgumentParser(description="Quota Retry Processor")
     p.add_argument("--db",          "-d", required=True, help="path to SQLite database")
-    p.add_argument("--delay",       "-D", type=float, default=2.4,
-                   help="seconds between requests (default 2.4)")
+    p.add_argument("--delay",       "-D", type=float, default=4.0,
+                   help="seconds between requests (default 4.0)")
     p.add_argument("--max-minutes", "-m", type=float, default=300,
                    help="stop before job timeout (default 300)")
     args = p.parse_args()
