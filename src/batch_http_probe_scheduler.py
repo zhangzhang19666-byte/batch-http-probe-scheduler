@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-⚠️ 本项目仅供个人学习与测试使用，严禁用于任何商业或非法用途。
-   FOR TESTING PURPOSES ONLY. DO NOT USE IN PRODUCTION.
+FOR TESTING PURPOSES ONLY. DO NOT USE IN PRODUCTION.
 
 Asynchronous HTTP Metadata Probe Scheduler
-- Sequential batch processing with configurable concurrency delay
-- WAL-mode SQLite backend with resume support
+- Batch-commit SQLite writes (every COMMIT_EVERY records)
+- DELETE journal mode: writes go directly to the main file, no WAL
+- SIGTERM handler: flushes pending batch before exit (safe for GitHub Actions cancel)
 - Quota-aware retry logic (up to N rounds)
 """
 
@@ -14,6 +14,7 @@ import argparse
 import json
 import logging
 import os
+import signal
 import sqlite3
 import sys
 import time
@@ -22,9 +23,10 @@ from pathlib import Path
 
 import requests
 
-# ── runtime config (injected via environment) ───────────────────────────
-_ENDPOINT   = os.environ.get("PROBE_ENDPOINT", "")
-_BATCH      = 200
+# ── runtime config ───────────────────────────────────────────────────────
+_ENDPOINT    = os.environ.get("PROBE_ENDPOINT", "")
+_BATCH       = 200          # rows fetched per DB query
+COMMIT_EVERY = 50           # flush to disk every N API calls
 _RETRY_WAITS = [90, 90, 90]
 
 # ── logging ──────────────────────────────────────────────────────────────
@@ -49,10 +51,15 @@ log = logging.getLogger(__name__)
 
 # ── db layer ─────────────────────────────────────────────────────────────
 
+_conn: sqlite3.Connection | None = None   # module-level for signal handler
+
 def _open_db(path: Path) -> sqlite3.Connection:
+    global _conn
     conn = sqlite3.connect(path)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
+    # DELETE journal: every commit writes directly to the main file.
+    # No WAL side-files, so cp results_all.db always captures the full state.
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute("PRAGMA synchronous=FULL")
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS magnet_results (
             magnet_url  TEXT PRIMARY KEY,
@@ -64,30 +71,32 @@ def _open_db(path: Path) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_status ON magnet_results(status);
     """)
     conn.commit()
+    _conn = conn
     return conn
 
 
 def _pending(conn: sqlite3.Connection, n: int) -> list[str]:
-    rows = conn.execute(
+    return [r[0] for r in conn.execute(
         "SELECT magnet_url FROM magnet_results WHERE status='pending' LIMIT ?", (n,)
-    ).fetchall()
-    return [r[0] for r in rows]
+    ).fetchall()]
 
 
 def _quota_limited(conn: sqlite3.Connection) -> list[str]:
-    rows = conn.execute(
+    return [r[0] for r in conn.execute(
         "SELECT magnet_url FROM magnet_results WHERE status='quota_limited'"
-    ).fetchall()
-    return [r[0] for r in rows]
+    ).fetchall()]
 
 
-def _save(conn: sqlite3.Connection, key: str, status: str, payload: dict):
+def _bulk_save(conn: sqlite3.Connection, rows: list[tuple]):
+    """Write a batch of (status, raw_json, checked_at, magnet_url) rows in one transaction."""
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    conn.execute(
+    conn.executemany(
         "UPDATE magnet_results SET status=?, raw_json=?, checked_at=? WHERE magnet_url=?",
-        (status, json.dumps(payload, ensure_ascii=False), ts, key),
+        [(status, json.dumps(payload, ensure_ascii=False), ts, key)
+         for key, status, payload in rows],
     )
     conn.commit()
+    log.debug("committed %d rows to disk", len(rows))
 
 
 def _counts(conn: sqlite3.Connection) -> dict:
@@ -116,32 +125,64 @@ def _probe(target: str) -> tuple[str, dict]:
 # ── batch runner ─────────────────────────────────────────────────────────
 
 def _run_batch(conn, items: list[str], delay: float, tag: str = "") -> list[str]:
-    quota = []
+    """
+    Process items one by one.
+    Accumulate results in memory, flush to DB every COMMIT_EVERY records.
+    Returns list of still-quota-limited URLs.
+    """
+    quota   = []
+    pending_rows: list[tuple] = []   # (key, status, payload)
+
+    def _flush():
+        if pending_rows:
+            _bulk_save(conn, pending_rows)
+            pending_rows.clear()
+
     for i, item in enumerate(items, 1):
         lbl = f"{tag}[{i:>5}/{len(items)}]"
         status, data = _probe(item)
-        _save(conn, item, status, data)
+
+        pending_rows.append((item, status, data))
+
         if status == "success":
-            log.info("%s  ✅ ok", lbl)
+            log.info("%s  ok", lbl)
         elif status == "quota_limited":
-            log.warning("%s  ⏳ quota – queued for retry", lbl)
+            log.warning("%s  quota – queued for retry", lbl)
             quota.append(item)
         else:
-            log.info("%s  ❌ failed  err=%s", lbl, data.get("error", "—"))
-        if i % 50 == 0:
+            log.info("%s  failed  err=%s", lbl, data.get("error", "-"))
+
+        # batch commit
+        if i % COMMIT_EVERY == 0:
+            _flush()
             _print_stats(conn, f"subtotal {i}/{len(items)}")
+
         time.sleep(delay)
+
+    _flush()   # commit any remaining rows
     return quota
 
 
 def _print_stats(conn, label="stats"):
     c = _counts(conn)
     log.info(
-        "── %s ── total=%d  ok=%d  fail=%d  quota=%d  pending=%d",
+        "-- %s -- total=%d  ok=%d  fail=%d  quota=%d  pending=%d",
         label, sum(c.values()),
         c.get("success", 0), c.get("failed", 0),
         c.get("quota_limited", 0), c.get("pending", 0),
     )
+
+# ── signal handler (GitHub Actions cancel = SIGTERM) ─────────────────────
+
+def _handle_sigterm(signum, frame):
+    log.warning("SIGTERM received – flushing DB and exiting")
+    if _conn:
+        try:
+            _conn.commit()
+        except Exception:
+            pass
+        _conn.close()
+    sys.exit(0)
 
 # ── entry point ───────────────────────────────────────────────────────────
 
@@ -149,6 +190,8 @@ def run(db_path: Path, delay: float, status_only: bool):
     if not _ENDPOINT:
         log.error("PROBE_ENDPOINT env var not set")
         sys.exit(1)
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
 
     conn = _open_db(db_path)
     _print_stats(conn, "startup")
@@ -159,7 +202,8 @@ def run(db_path: Path, delay: float, status_only: bool):
 
     # phase 1 – pending
     log.info("=" * 60)
-    log.info("phase 1: pending records  (delay=%.1fs)", delay)
+    log.info("phase 1: pending records  (delay=%.1fs  commit_every=%d)",
+             delay, COMMIT_EVERY)
     log.info("=" * 60)
     done = 0
     while True:
@@ -187,7 +231,7 @@ def run(db_path: Path, delay: float, status_only: bool):
                  rnd, len(limited) - len(remaining), len(remaining))
         _print_stats(conn, f"after retry round {rnd}")
         if not remaining:
-            log.info("all quota_limited resolved ✅")
+            log.info("all quota_limited resolved")
             break
     else:
         leftover = len(_quota_limited(conn))
@@ -212,7 +256,7 @@ def main():
     log_file = db_path.parent / "probe_scheduler.log"
     _init_log(log_file)
 
-    log.info("db=%s  delay=%.1fs", db_path, args.delay)
+    log.info("db=%s  delay=%.1fs  commit_every=%d", db_path, args.delay, COMMIT_EVERY)
 
     if not db_path.exists():
         log.error("db not found: %s", db_path)
@@ -222,6 +266,9 @@ def main():
         run(db_path, args.delay, args.status)
     except KeyboardInterrupt:
         log.warning("interrupted – progress saved, resume by restarting")
+        if _conn:
+            _conn.commit()
+            _conn.close()
         sys.exit(0)
 
 

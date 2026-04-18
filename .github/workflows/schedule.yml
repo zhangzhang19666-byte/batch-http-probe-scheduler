@@ -29,16 +29,27 @@ jobs:
       - name: Fetch dataset
         env:
           DATA_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
-          DATA_REPO:  ${{ secrets.DATA_REPO_SLUG }}   # e.g. yourname/private-data-store
+          DATA_REPO:  ${{ secrets.DATA_REPO_SLUG }}
         run: |
+          git lfs install
           git clone "https://x-access-token:${DATA_TOKEN}@github.com/${DATA_REPO}.git" _datastore
           if [ -f "_datastore/results_all.db" ]; then
+            # Copy DB; also copy WAL side-files if they exist (DELETE journal has none,
+            # but guard in case a legacy WAL-mode DB is present)
             cp _datastore/results_all.db results_all.db
+            [ -f "_datastore/results_all.db-wal" ] && cp _datastore/results_all.db-wal results_all.db-wal || true
+            [ -f "_datastore/results_all.db-shm" ] && cp _datastore/results_all.db-shm results_all.db-shm || true
+            # Force WAL checkpoint so the main file is fully self-contained before Python opens it
+            sqlite3 results_all.db "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;"
             echo "DB restored ($(du -sh results_all.db | cut -f1))"
           else
             echo "No existing DB found – starting fresh"
             touch results_all.db
           fi
+
+      # ── system deps ─────────────────────────────────────────────────
+      - name: Install system deps
+        run: sudo apt-get install -y sqlite3
 
       # ── Python env ──────────────────────────────────────────────────
       - name: Set up Python
@@ -63,13 +74,16 @@ jobs:
 
       # ── push DB back to private data repo ───────────────────────────
       - name: Sync dataset
-        if: always()   # push even if processor exits non-zero (saves partial progress)
+        if: always()
         env:
           DATA_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
           DATA_REPO:  ${{ secrets.DATA_REPO_SLUG }}
         run: |
+          # Ensure DELETE journal: WAL is fully merged into main file before copy
+          sqlite3 results_all.db "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;" 2>/dev/null || true
           cp results_all.db _datastore/results_all.db
           cd _datastore
+          git lfs install
           git config user.email "actions@github.com"
           git config user.name  "GitHub Actions"
           git add results_all.db
