@@ -3,8 +3,6 @@ name: Data Processing Pipeline
 # FOR TESTING PURPOSES ONLY
 
 on:
-  schedule:
-    - cron: '0 2 * * *'   # daily at 02:00 UTC
   workflow_dispatch:
     inputs:
       delay:
@@ -104,3 +102,21 @@ jobs:
           name: probe-log-${{ github.run_number }}
           path: probe_scheduler.log
           retention-days: 7
+
+      # ── auto-trigger next run ────────────────────────────────────────
+      - name: Trigger next run
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+        run: |
+          # Check if there are still pending records before re-triggering
+          PENDING=$(sqlite3 results_all.db "SELECT COUNT(*) FROM magnet_results WHERE status='pending';" 2>/dev/null || echo "1")
+          if [ "$PENDING" -gt "0" ]; then
+            echo "Still $PENDING pending rows – triggering next run"
+            gh workflow run schedule.yml \
+              --repo ${{ github.repository }} \
+              -f delay="${{ github.event.inputs.delay || '2.4' }}" \
+              -f status_only="false"
+          else
+            echo "All records processed – no next run needed"
+          fi
