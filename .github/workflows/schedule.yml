@@ -15,14 +15,14 @@ on:
         description: 'Print stats only (true/false)'
         required: false
         default: 'false'
-      row_start:
-        description: 'Start from rowid N (0 = from beginning)'
+      worker_id:
+        description: 'This worker index (0-based). e.g. 0 or 1'
         required: false
         default: '0'
-      row_end:
-        description: 'End at rowid N (0 = no upper limit)'
+      total_workers:
+        description: 'Total parallel workers. 1 = no split, 2 = split in half'
         required: false
-        default: '0'
+        default: '1'
 
 jobs:
   process:
@@ -80,12 +80,11 @@ jobs:
         run: |
           DELAY="${{ github.event.inputs.delay || '1.5' }}"
           STATUS="${{ github.event.inputs.status_only || 'false' }}"
-          ROW_START="${{ github.event.inputs.row_start || '0' }}"
-          ROW_END="${{ github.event.inputs.row_end || '0' }}"
+          WORKER_ID="${{ github.event.inputs.worker_id || '0' }}"
+          TOTAL="${{ github.event.inputs.total_workers || '1' }}"
           ARGS="--db results_all.db --delay $DELAY --max-minutes 300"
+          ARGS="$ARGS --worker-id $WORKER_ID --total-workers $TOTAL"
           if [ "$STATUS" = "true" ]; then ARGS="$ARGS --status"; fi
-          [ "$ROW_START" != "0" ] && ARGS="$ARGS --row-start $ROW_START"
-          [ "$ROW_END"   != "0" ] && ARGS="$ARGS --row-end $ROW_END"
           exec python src/batch_http_probe_scheduler.py $ARGS
 
       # ── push DB back to private data repo ───────────────────────────
