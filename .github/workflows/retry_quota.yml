@@ -1,0 +1,116 @@
+name: Quota Retry Pipeline
+
+# FOR TESTING PURPOSES ONLY
+
+on:
+  workflow_dispatch:
+    inputs:
+      delay:
+        description: 'Request delay in seconds'
+        required: false
+        default: '2.4'
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      actions: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── pull DB from private data repo ──────────────────────────────
+      - name: Fetch dataset
+        env:
+          DATA_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+          DATA_REPO:  ${{ secrets.DATA_REPO_SLUG }}
+        run: |
+          if [ -z "$DATA_REPO" ] || [ -z "$DATA_TOKEN" ]; then
+            echo "ERROR: DATA_REPO_SLUG or DATA_REPO_TOKEN secret is not set"
+            exit 1
+          fi
+          git lfs install
+          git clone "https://x-access-token:${DATA_TOKEN}@github.com/${DATA_REPO}.git" _datastore
+          if [ -f "_datastore/results_all.db" ]; then
+            cp _datastore/results_all.db results_all.db
+            sqlite3 results_all.db "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;"
+            QUOTA=$(sqlite3 results_all.db "SELECT COUNT(*) FROM magnet_results WHERE status='quota_limited';")
+            echo "DB restored – quota_limited records: $QUOTA"
+            if [ "$QUOTA" -eq "0" ]; then
+              echo "Nothing to retry – exiting"
+              exit 0
+            fi
+          else
+            echo "No DB found"
+            exit 1
+          fi
+
+      # ── system deps ─────────────────────────────────────────────────
+      - name: Install system deps
+        run: sudo apt-get install -y sqlite3
+
+      # ── Python env ──────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── run quota retry ─────────────────────────────────────────────
+      - name: Run quota retry
+        timeout-minutes: 330
+        env:
+          PROBE_ENDPOINT: ${{ secrets.PROBE_ENDPOINT }}
+        run: |
+          DELAY="${{ github.event.inputs.delay || '2.4' }}"
+          exec python src/quota_retry.py --db results_all.db --delay $DELAY --max-minutes 300
+
+      # ── push DB back ────────────────────────────────────────────────
+      - name: Sync dataset
+        if: always()
+        env:
+          DATA_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+          DATA_REPO:  ${{ secrets.DATA_REPO_SLUG }}
+        run: |
+          sqlite3 results_all.db "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;" 2>/dev/null || true
+          mkdir -p _datastore
+          cp results_all.db _datastore/results_all.db
+          cd _datastore
+          git lfs install
+          git config user.email "actions@github.com"
+          git config user.name  "GitHub Actions"
+          git add results_all.db
+          git diff --cached --quiet \
+            && echo "No changes to DB" \
+            || git commit -m "chore: quota retry $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push "https://x-access-token:${DATA_TOKEN}@github.com/${DATA_REPO}.git" HEAD
+
+      # ── upload log ──────────────────────────────────────────────────
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quota-retry-log-${{ github.run_number }}
+          path: quota_retry.log
+          retention-days: 7
+
+      # ── auto-trigger next run if still quota_limited ─────────────────
+      - name: Trigger next run
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          QUOTA=$(sqlite3 results_all.db "SELECT COUNT(*) FROM magnet_results WHERE status='quota_limited';" 2>/dev/null || echo "0")
+          if [ "$QUOTA" -gt "0" ]; then
+            echo "Still $QUOTA quota_limited – triggering next retry run"
+            gh workflow run retry_quota.yml \
+              --repo ${{ github.repository }} \
+              -f delay="${{ github.event.inputs.delay || '2.4' }}"
+          else
+            echo "No more quota_limited records – done"
+          fi
