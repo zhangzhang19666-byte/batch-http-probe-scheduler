@@ -19,7 +19,7 @@ on:
 jobs:
   process:
     runs-on: ubuntu-latest
-    timeout-minutes: 340
+    timeout-minutes: 360   # GitHub Actions hard limit for public repos
 
     steps:
       - name: Checkout
@@ -62,13 +62,17 @@ jobs:
         run: pip install -r requirements.txt
 
       # ── run ─────────────────────────────────────────────────────────
+      # Step timeout = 330 min. Python self-stops at 300 min (--max-minutes).
+      # This leaves 30 min for Sync dataset to upload the DB, well before
+      # the 360-min job hard limit.
       - name: Run processor
+        timeout-minutes: 330
         env:
           PROBE_ENDPOINT: ${{ secrets.PROBE_ENDPOINT }}
         run: |
           DELAY="${{ github.event.inputs.delay || '1.5' }}"
           STATUS="${{ github.event.inputs.status_only || 'false' }}"
-          ARGS="--db results_all.db --delay $DELAY"
+          ARGS="--db results_all.db --delay $DELAY --max-minutes 300"
           if [ "$STATUS" = "true" ]; then ARGS="$ARGS --status"; fi
           python src/batch_http_probe_scheduler.py $ARGS
 

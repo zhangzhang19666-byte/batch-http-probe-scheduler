@@ -4,9 +4,9 @@
 FOR TESTING PURPOSES ONLY. DO NOT USE IN PRODUCTION.
 
 Asynchronous HTTP Metadata Probe Scheduler
-- Batch-commit SQLite writes (every COMMIT_EVERY records)
-- DELETE journal mode: writes go directly to the main file, no WAL
-- SIGTERM handler: flushes pending batch before exit (safe for GitHub Actions cancel)
+- Commit every single record (DELETE journal, no WAL side-files)
+- --max-minutes: self-terminates gracefully before GitHub Actions job timeout
+- SIGTERM handler: flushes pending write before exit
 - Quota-aware retry logic (up to N rounds)
 """
 
@@ -24,10 +24,10 @@ from pathlib import Path
 import requests
 
 # ── runtime config ───────────────────────────────────────────────────────
-_ENDPOINT    = os.environ.get("PROBE_ENDPOINT", "")
-_BATCH       = 200          # rows fetched per DB query
-COMMIT_EVERY  = 1           # flush to disk after every single record
-STATS_EVERY   = 50          # print progress summary every N records
+_ENDPOINT   = os.environ.get("PROBE_ENDPOINT", "")
+_BATCH      = 200
+COMMIT_EVERY = 1            # commit after every single record
+STATS_EVERY  = 50           # print progress every N records
 _RETRY_WAITS = [90, 90, 90]
 
 # ── logging ──────────────────────────────────────────────────────────────
@@ -52,13 +52,11 @@ log = logging.getLogger(__name__)
 
 # ── db layer ─────────────────────────────────────────────────────────────
 
-_conn: sqlite3.Connection | None = None   # module-level for signal handler
+_conn: sqlite3.Connection | None = None
 
 def _open_db(path: Path) -> sqlite3.Connection:
     global _conn
     conn = sqlite3.connect(path)
-    # DELETE journal: every commit writes directly to the main file.
-    # No WAL side-files, so cp results_all.db always captures the full state.
     conn.execute("PRAGMA journal_mode=DELETE")
     conn.execute("PRAGMA synchronous=FULL")
     conn.executescript("""
@@ -76,20 +74,19 @@ def _open_db(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def _pending(conn: sqlite3.Connection, n: int) -> list[str]:
+def _pending(conn, n):
     return [r[0] for r in conn.execute(
         "SELECT magnet_url FROM magnet_results WHERE status='pending' LIMIT ?", (n,)
     ).fetchall()]
 
 
-def _quota_limited(conn: sqlite3.Connection) -> list[str]:
+def _quota_limited(conn):
     return [r[0] for r in conn.execute(
         "SELECT magnet_url FROM magnet_results WHERE status='quota_limited'"
     ).fetchall()]
 
 
-def _bulk_save(conn: sqlite3.Connection, rows: list[tuple]):
-    """Write a batch of (status, raw_json, checked_at, magnet_url) rows in one transaction."""
+def _bulk_save(conn, rows: list[tuple]):
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     conn.executemany(
         "UPDATE magnet_results SET status=?, raw_json=?, checked_at=? WHERE magnet_url=?",
@@ -100,7 +97,7 @@ def _bulk_save(conn: sqlite3.Connection, rows: list[tuple]):
     log.debug("committed %d rows to disk", len(rows))
 
 
-def _counts(conn: sqlite3.Connection) -> dict:
+def _counts(conn):
     return {r[0]: r[1] for r in conn.execute(
         "SELECT status, COUNT(*) FROM magnet_results GROUP BY status"
     ).fetchall()}
@@ -123,16 +120,25 @@ def _probe(target: str) -> tuple[str, dict]:
     except Exception as e:
         return "failed", {"error": str(e)}
 
+# ── time budget ───────────────────────────────────────────────────────────
+
+_deadline: float = float("inf")   # epoch seconds, set in run()
+
+def _time_left() -> float:
+    return _deadline - time.monotonic()
+
+def _over_budget() -> bool:
+    return time.monotonic() >= _deadline
+
 # ── batch runner ─────────────────────────────────────────────────────────
 
-def _run_batch(conn, items: list[str], delay: float, tag: str = "") -> list[str]:
+def _run_batch(conn, items: list[str], delay: float, tag: str = "") -> tuple[list[str], bool]:
     """
-    Process items one by one.
-    Accumulate results in memory, flush to DB every COMMIT_EVERY records.
-    Returns list of still-quota-limited URLs.
+    Returns (quota_urls, timed_out).
+    timed_out=True means deadline was reached mid-batch; caller should stop.
     """
-    quota   = []
-    pending_rows: list[tuple] = []   # (key, status, payload)
+    quota: list[str] = []
+    pending_rows: list[tuple] = []
 
     def _flush():
         if pending_rows:
@@ -140,9 +146,14 @@ def _run_batch(conn, items: list[str], delay: float, tag: str = "") -> list[str]
             pending_rows.clear()
 
     for i, item in enumerate(items, 1):
+        if _over_budget():
+            _flush()
+            log.warning("time budget exhausted at %s[%d/%d] – saving and exiting",
+                        tag, i, len(items))
+            return quota, True
+
         lbl = f"{tag}[{i:>5}/{len(items)}]"
         status, data = _probe(item)
-
         pending_rows.append((item, status, data))
 
         if status == "success":
@@ -156,12 +167,13 @@ def _run_batch(conn, items: list[str], delay: float, tag: str = "") -> list[str]
         if i % COMMIT_EVERY == 0:
             _flush()
         if i % STATS_EVERY == 0:
+            log.info("time left: %.1f min", _time_left() / 60)
             _print_stats(conn, f"subtotal {i}/{len(items)}")
 
         time.sleep(delay)
 
-    _flush()   # commit any remaining rows
-    return quota
+    _flush()
+    return quota, False
 
 
 def _print_stats(conn, label="stats"):
@@ -173,7 +185,7 @@ def _print_stats(conn, label="stats"):
         c.get("quota_limited", 0), c.get("pending", 0),
     )
 
-# ── signal handler (GitHub Actions cancel = SIGTERM) ─────────────────────
+# ── signal handler ────────────────────────────────────────────────────────
 
 def _handle_sigterm(signum, frame):
     log.warning("SIGTERM received – flushing DB and exiting")
@@ -187,12 +199,18 @@ def _handle_sigterm(signum, frame):
 
 # ── entry point ───────────────────────────────────────────────────────────
 
-def run(db_path: Path, delay: float, status_only: bool):
+def run(db_path: Path, delay: float, status_only: bool, max_minutes: float):
+    global _deadline
+
     if not _ENDPOINT:
         log.error("PROBE_ENDPOINT env var not set")
         sys.exit(1)
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
+
+    # set deadline: exit max_minutes from now so Sync dataset has time to run
+    _deadline = time.monotonic() + max_minutes * 60
+    log.info("time budget: %.0f min (deadline in %.0f min)", max_minutes, max_minutes)
 
     conn = _open_db(db_path)
     _print_stats(conn, "startup")
@@ -201,44 +219,51 @@ def run(db_path: Path, delay: float, status_only: bool):
         conn.close()
         return
 
-    # phase 1 – pending
     log.info("=" * 60)
-    log.info("phase 1: pending records  (delay=%.1fs  commit_every=%d)",
-             delay, COMMIT_EVERY)
+    log.info("phase 1: pending  (delay=%.1fs)", delay)
     log.info("=" * 60)
     done = 0
-    while True:
+    while not _over_budget():
         batch = _pending(conn, _BATCH)
         if not batch:
             log.info("all pending processed (%d total)", done)
             break
-        _run_batch(conn, batch, delay, tag="P")
+        _, timed_out = _run_batch(conn, batch, delay, tag="P")
         done += len(batch)
         _print_stats(conn, f"after {done} records")
+        if timed_out:
+            break
 
-    # phase 2 – quota retry
+    if _over_budget():
+        log.warning("time budget reached – progress saved, next run resumes here")
+        _print_stats(conn, "exit snapshot")
+        conn.close()
+        return
+
     for rnd, wait in enumerate(_RETRY_WAITS, 1):
         limited = _quota_limited(conn)
         if not limited:
-            log.info("no quota_limited records – skip retry")
+            log.info("no quota_limited – skip retry")
+            break
+        if _time_left() < wait + 60:
+            log.warning("not enough time for retry round %d – deferring to next run", rnd)
             break
         log.info("=" * 60)
-        log.info("phase 2 round %d/%d: %d items, waiting %ds",
-                 rnd, len(_RETRY_WAITS), len(limited), wait)
+        log.info("phase 2 round %d/%d: %d items, waiting %ds", rnd, len(_RETRY_WAITS), len(limited), wait)
         log.info("=" * 60)
         time.sleep(wait)
-        remaining = _run_batch(conn, limited, delay, tag=f"R{rnd}")
-        log.info("round %d done: resolved=%d  still_limited=%d",
-                 rnd, len(limited) - len(remaining), len(remaining))
+        remaining, timed_out = _run_batch(conn, limited, delay, tag=f"R{rnd}")
+        log.info("round %d: resolved=%d  still_limited=%d", rnd, len(limited) - len(remaining), len(remaining))
         _print_stats(conn, f"after retry round {rnd}")
         if not remaining:
             log.info("all quota_limited resolved")
             break
+        if timed_out:
+            break
     else:
         leftover = len(_quota_limited(conn))
         if leftover:
-            log.warning("%d items still quota_limited after %d rounds – resume next run",
-                        leftover, len(_RETRY_WAITS))
+            log.warning("%d still quota_limited – resume next run", leftover)
 
     _print_stats(conn, "final")
     conn.close()
@@ -246,27 +271,27 @@ def run(db_path: Path, delay: float, status_only: bool):
 
 def main():
     p = argparse.ArgumentParser(description="Async HTTP Metadata Probe Scheduler")
-    p.add_argument("--db",    "-d", required=True, help="path to SQLite database")
-    p.add_argument("--delay", "-D", type=float, default=1.5,
-                   help="seconds between requests (default 1.5)")
-    p.add_argument("--status", "-s", action="store_true",
-                   help="print progress then exit")
+    p.add_argument("--db",          "-d", required=True)
+    p.add_argument("--delay",       "-D", type=float, default=1.5)
+    p.add_argument("--status",      "-s", action="store_true")
+    p.add_argument("--max-minutes", "-m", type=float, default=300,
+                   help="stop processing after N minutes so Sync has time to run (default 300)")
     args = p.parse_args()
 
     db_path  = Path(args.db)
     log_file = db_path.parent / "probe_scheduler.log"
     _init_log(log_file)
 
-    log.info("db=%s  delay=%.1fs  commit_every=%d", db_path, args.delay, COMMIT_EVERY)
+    log.info("db=%s  delay=%.1fs  max_minutes=%.0f", db_path, args.delay, args.max_minutes)
 
     if not db_path.exists():
         log.error("db not found: %s", db_path)
         sys.exit(1)
 
     try:
-        run(db_path, args.delay, args.status)
+        run(db_path, args.delay, args.status, args.max_minutes)
     except KeyboardInterrupt:
-        log.warning("interrupted – progress saved, resume by restarting")
+        log.warning("interrupted – progress saved")
         if _conn:
             _conn.commit()
             _conn.close()
