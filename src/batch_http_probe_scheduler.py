@@ -26,7 +26,7 @@ import requests
 # ── runtime config ───────────────────────────────────────────────────────
 _ENDPOINT    = os.environ.get("PROBE_ENDPOINT", "")
 _BATCH       = 200          # rows fetched per DB query
-COMMIT_EVERY = 50           # flush to disk every N API calls
+COMMIT_EVERY = 1            # flush to disk after every single record
 _RETRY_WAITS = [90, 90, 90]
 
 # ── logging ──────────────────────────────────────────────────────────────
