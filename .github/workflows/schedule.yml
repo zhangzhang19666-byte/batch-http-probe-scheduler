@@ -1,0 +1,88 @@
+name: Data Processing Pipeline
+
+# ⚠️ FOR TESTING PURPOSES ONLY
+
+on:
+  schedule:
+    - cron: '0 2 * * *'   # daily at 02:00 UTC
+  workflow_dispatch:
+    inputs:
+      delay:
+        description: 'Request delay in seconds'
+        required: false
+        default: '1.5'
+      status_only:
+        description: 'Print stats only (true/false)'
+        required: false
+        default: 'false'
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── pull DB from private data repo ──────────────────────────────
+      - name: Fetch dataset
+        env:
+          DATA_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+          DATA_REPO:  ${{ secrets.DATA_REPO_SLUG }}   # e.g. yourname/private-data-store
+        run: |
+          git clone "https://x-access-token:${DATA_TOKEN}@github.com/${DATA_REPO}.git" _datastore
+          if [ -f "_datastore/results_all.db" ]; then
+            cp _datastore/results_all.db results_all.db
+            echo "DB restored ($(du -sh results_all.db | cut -f1))"
+          else
+            echo "No existing DB found – starting fresh"
+            touch results_all.db
+          fi
+
+      # ── Python env ──────────────────────────────────────────────────
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── run ─────────────────────────────────────────────────────────
+      - name: Run processor
+        env:
+          PROBE_ENDPOINT: ${{ secrets.PROBE_ENDPOINT }}
+        run: |
+          DELAY="${{ github.event.inputs.delay || '1.5' }}"
+          STATUS="${{ github.event.inputs.status_only || 'false' }}"
+          ARGS="--db results_all.db --delay $DELAY"
+          if [ "$STATUS" = "true" ]; then ARGS="$ARGS --status"; fi
+          python src/batch_http_probe_scheduler.py $ARGS
+
+      # ── push DB back to private data repo ───────────────────────────
+      - name: Sync dataset
+        if: always()   # push even if processor exits non-zero (saves partial progress)
+        env:
+          DATA_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+          DATA_REPO:  ${{ secrets.DATA_REPO_SLUG }}
+        run: |
+          cp results_all.db _datastore/results_all.db
+          cd _datastore
+          git config user.email "actions@github.com"
+          git config user.name  "GitHub Actions"
+          git add results_all.db
+          git diff --cached --quiet \
+            && echo "No changes to DB" \
+            || git commit -m "chore: update dataset $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push "https://x-access-token:${DATA_TOKEN}@github.com/${DATA_REPO}.git" HEAD
+
+      # ── upload log as artifact ───────────────────────────────────────
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-log-${{ github.run_number }}
+          path: probe_scheduler.log
+          retention-days: 7
