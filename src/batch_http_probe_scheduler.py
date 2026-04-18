@@ -74,16 +74,42 @@ def _open_db(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def _pending(conn, n):
-    return [r[0] for r in conn.execute(
-        "SELECT magnet_url FROM magnet_results WHERE status='pending' LIMIT ?", (n,)
-    ).fetchall()]
+def _pending(conn, n, row_start=0, row_end=0):
+    if row_end > 0:
+        return [r[0] for r in conn.execute(
+            "SELECT magnet_url FROM magnet_results "
+            "WHERE status='pending' AND rowid >= ? AND rowid <= ? LIMIT ?",
+            (row_start, row_end, n)
+        ).fetchall()]
+    elif row_start > 0:
+        return [r[0] for r in conn.execute(
+            "SELECT magnet_url FROM magnet_results "
+            "WHERE status='pending' AND rowid >= ? LIMIT ?",
+            (row_start, n)
+        ).fetchall()]
+    else:
+        return [r[0] for r in conn.execute(
+            "SELECT magnet_url FROM magnet_results WHERE status='pending' LIMIT ?", (n,)
+        ).fetchall()]
 
 
-def _quota_limited(conn):
-    return [r[0] for r in conn.execute(
-        "SELECT magnet_url FROM magnet_results WHERE status='quota_limited'"
-    ).fetchall()]
+def _quota_limited(conn, row_start=0, row_end=0):
+    if row_end > 0:
+        return [r[0] for r in conn.execute(
+            "SELECT magnet_url FROM magnet_results "
+            "WHERE status='quota_limited' AND rowid >= ? AND rowid <= ?",
+            (row_start, row_end)
+        ).fetchall()]
+    elif row_start > 0:
+        return [r[0] for r in conn.execute(
+            "SELECT magnet_url FROM magnet_results "
+            "WHERE status='quota_limited' AND rowid >= ?",
+            (row_start,)
+        ).fetchall()]
+    else:
+        return [r[0] for r in conn.execute(
+            "SELECT magnet_url FROM magnet_results WHERE status='quota_limited'"
+        ).fetchall()]
 
 
 def _bulk_save(conn, rows: list[tuple]):
@@ -199,7 +225,8 @@ def _handle_sigterm(signum, frame):
 
 # ── entry point ───────────────────────────────────────────────────────────
 
-def run(db_path: Path, delay: float, status_only: bool, max_minutes: float):
+def run(db_path: Path, delay: float, status_only: bool, max_minutes: float,
+        row_start: int = 0, row_end: int = 0):
     global _deadline
 
     if not _ENDPOINT:
@@ -211,6 +238,8 @@ def run(db_path: Path, delay: float, status_only: bool, max_minutes: float):
     # set deadline: exit max_minutes from now so Sync dataset has time to run
     _deadline = time.monotonic() + max_minutes * 60
     log.info("time budget: %.0f min (deadline in %.0f min)", max_minutes, max_minutes)
+    if row_start or row_end:
+        log.info("row range: %d – %s", row_start, row_end if row_end else "end")
 
     conn = _open_db(db_path)
     _print_stats(conn, "startup")
@@ -220,13 +249,14 @@ def run(db_path: Path, delay: float, status_only: bool, max_minutes: float):
         return
 
     log.info("=" * 60)
-    log.info("phase 1: pending  (delay=%.1fs)", delay)
+    log.info("phase 1: pending  (delay=%.1fs  rows=%d-%s)",
+             delay, row_start, row_end if row_end else "end")
     log.info("=" * 60)
     done = 0
     while not _over_budget():
-        batch = _pending(conn, _BATCH)
+        batch = _pending(conn, _BATCH, row_start, row_end)
         if not batch:
-            log.info("all pending processed (%d total)", done)
+            log.info("all pending processed in range (%d total)", done)
             break
         _, timed_out = _run_batch(conn, batch, delay, tag="P")
         done += len(batch)
@@ -241,7 +271,7 @@ def run(db_path: Path, delay: float, status_only: bool, max_minutes: float):
         return
 
     for rnd, wait in enumerate(_RETRY_WAITS, 1):
-        limited = _quota_limited(conn)
+        limited = _quota_limited(conn, row_start, row_end)
         if not limited:
             log.info("no quota_limited – skip retry")
             break
@@ -252,7 +282,7 @@ def run(db_path: Path, delay: float, status_only: bool, max_minutes: float):
         log.info("phase 2 round %d/%d: %d items, waiting %ds", rnd, len(_RETRY_WAITS), len(limited), wait)
         log.info("=" * 60)
         time.sleep(wait)
-        remaining, timed_out = _run_batch(conn, limited, delay, tag=f"R{rnd}")
+        remaining, timed_out = _run_batch(conn, limited, delay, tag=f"R{rnd}")  # noqa: E501
         log.info("round %d: resolved=%d  still_limited=%d", rnd, len(limited) - len(remaining), len(remaining))
         _print_stats(conn, f"after retry round {rnd}")
         if not remaining:
@@ -276,6 +306,10 @@ def main():
     p.add_argument("--status",      "-s", action="store_true")
     p.add_argument("--max-minutes", "-m", type=float, default=300,
                    help="stop processing after N minutes so Sync has time to run (default 300)")
+    p.add_argument("--row-start", type=int, default=0,
+                   help="process only rows with rowid >= N (0 = from beginning)")
+    p.add_argument("--row-end",   type=int, default=0,
+                   help="process only rows with rowid <= N (0 = no upper limit)")
     args = p.parse_args()
 
     db_path  = Path(args.db)
@@ -289,7 +323,8 @@ def main():
         sys.exit(1)
 
     try:
-        run(db_path, args.delay, args.status, args.max_minutes)
+        run(db_path, args.delay, args.status, args.max_minutes,
+            args.row_start, args.row_end)
     except KeyboardInterrupt:
         log.warning("interrupted – progress saved")
         if _conn:

@@ -15,6 +15,14 @@ on:
         description: 'Print stats only (true/false)'
         required: false
         default: 'false'
+      row_start:
+        description: 'Start from rowid N (0 = from beginning)'
+        required: false
+        default: '0'
+      row_end:
+        description: 'End at rowid N (0 = no upper limit)'
+        required: false
+        default: '0'
 
 jobs:
   process:
@@ -72,8 +80,12 @@ jobs:
         run: |
           DELAY="${{ github.event.inputs.delay || '1.5' }}"
           STATUS="${{ github.event.inputs.status_only || 'false' }}"
+          ROW_START="${{ github.event.inputs.row_start || '0' }}"
+          ROW_END="${{ github.event.inputs.row_end || '0' }}"
           ARGS="--db results_all.db --delay $DELAY --max-minutes 300"
           if [ "$STATUS" = "true" ]; then ARGS="$ARGS --status"; fi
+          [ "$ROW_START" != "0" ] && ARGS="$ARGS --row-start $ROW_START"
+          [ "$ROW_END"   != "0" ] && ARGS="$ARGS --row-end $ROW_END"
           exec python src/batch_http_probe_scheduler.py $ARGS
 
       # ── push DB back to private data repo ───────────────────────────
