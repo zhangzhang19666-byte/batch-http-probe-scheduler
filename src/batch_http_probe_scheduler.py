@@ -26,7 +26,8 @@ import requests
 # ── runtime config ───────────────────────────────────────────────────────
 _ENDPOINT    = os.environ.get("PROBE_ENDPOINT", "")
 _BATCH       = 200          # rows fetched per DB query
-COMMIT_EVERY = 1            # flush to disk after every single record
+COMMIT_EVERY  = 1           # flush to disk after every single record
+STATS_EVERY   = 50          # print progress summary every N records
 _RETRY_WAITS = [90, 90, 90]
 
 # ── logging ──────────────────────────────────────────────────────────────
@@ -152,9 +153,9 @@ def _run_batch(conn, items: list[str], delay: float, tag: str = "") -> list[str]
         else:
             log.info("%s  failed  err=%s", lbl, data.get("error", "-"))
 
-        # batch commit
         if i % COMMIT_EVERY == 0:
             _flush()
+        if i % STATS_EVERY == 0:
             _print_stats(conn, f"subtotal {i}/{len(items)}")
 
         time.sleep(delay)
