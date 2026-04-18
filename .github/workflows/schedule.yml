@@ -10,7 +10,7 @@ on:
       delay:
         description: 'Request delay in seconds'
         required: false
-        default: '1.5'
+        default: '2.4'
       status_only:
         description: 'Print stats only (true/false)'
         required: false
@@ -74,7 +74,7 @@ jobs:
           STATUS="${{ github.event.inputs.status_only || 'false' }}"
           ARGS="--db results_all.db --delay $DELAY --max-minutes 300"
           if [ "$STATUS" = "true" ]; then ARGS="$ARGS --status"; fi
-          python src/batch_http_probe_scheduler.py $ARGS
+          exec python src/batch_http_probe_scheduler.py $ARGS
 
       # ── push DB back to private data repo ───────────────────────────
       - name: Sync dataset

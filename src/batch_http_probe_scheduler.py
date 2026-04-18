@@ -272,7 +272,7 @@ def run(db_path: Path, delay: float, status_only: bool, max_minutes: float):
 def main():
     p = argparse.ArgumentParser(description="Async HTTP Metadata Probe Scheduler")
     p.add_argument("--db",          "-d", required=True)
-    p.add_argument("--delay",       "-D", type=float, default=1.5)
+    p.add_argument("--delay",       "-D", type=float, default=2.4)
     p.add_argument("--status",      "-s", action="store_true")
     p.add_argument("--max-minutes", "-m", type=float, default=300,
                    help="stop processing after N minutes so Sync has time to run (default 300)")
