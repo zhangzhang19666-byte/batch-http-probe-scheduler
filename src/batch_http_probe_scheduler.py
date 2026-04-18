@@ -204,9 +204,9 @@ def _handle_sigterm(signum, frame):
     if _conn:
         try:
             _conn.commit()
+            _conn.close()
         except Exception:
             pass
-        _conn.close()
     sys.exit(0)
 
 # ── entry point ───────────────────────────────────────────────────────────

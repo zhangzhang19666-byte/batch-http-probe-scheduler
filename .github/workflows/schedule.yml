@@ -17,7 +17,9 @@ on:
 jobs:
   process:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # GitHub Actions hard limit for public repos
+    timeout-minutes: 360
+    permissions:
+      actions: write   # needed for gh workflow run (self-trigger)
 
     steps:
       - name: Checkout
@@ -29,6 +31,10 @@ jobs:
           DATA_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
           DATA_REPO:  ${{ secrets.DATA_REPO_SLUG }}
         run: |
+          if [ -z "$DATA_REPO" ] || [ -z "$DATA_TOKEN" ]; then
+            echo "ERROR: DATA_REPO_SLUG or DATA_REPO_TOKEN secret is not set"
+            exit 1
+          fi
           git lfs install
           git clone "https://x-access-token:${DATA_TOKEN}@github.com/${DATA_REPO}.git" _datastore
           if [ -f "_datastore/results_all.db" ]; then
@@ -68,7 +74,7 @@ jobs:
         env:
           PROBE_ENDPOINT: ${{ secrets.PROBE_ENDPOINT }}
         run: |
-          DELAY="${{ github.event.inputs.delay || '1.5' }}"
+          DELAY="${{ github.event.inputs.delay || '2.4' }}"
           STATUS="${{ github.event.inputs.status_only || 'false' }}"
           ARGS="--db results_all.db --delay $DELAY --max-minutes 300"
           if [ "$STATUS" = "true" ]; then ARGS="$ARGS --status"; fi
@@ -83,6 +89,7 @@ jobs:
         run: |
           # Ensure DELETE journal: WAL is fully merged into main file before copy
           sqlite3 results_all.db "PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;" 2>/dev/null || true
+          mkdir -p _datastore
           cp results_all.db _datastore/results_all.db
           cd _datastore
           git lfs install
@@ -107,7 +114,7 @@ jobs:
       - name: Trigger next run
         if: always()
         env:
-          GH_TOKEN: ${{ secrets.DATA_REPO_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           # Check if there are still pending records before re-triggering
           PENDING=$(sqlite3 results_all.db "SELECT COUNT(*) FROM magnet_results WHERE status='pending';" 2>/dev/null || echo "1")
